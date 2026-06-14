@@ -1,5 +1,4 @@
 import io
-import math
 import re
 import zipfile
 from dataclasses import dataclass
@@ -11,14 +10,6 @@ import streamlit as st
 
 st.set_page_config(page_title="NaviPac NPD RMS", layout="wide")
 
-NPD_PATTERN = re.compile(
-    r"(?P<timestamp>\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}:\d{2})\s*,\s*"
-    r"(?P<heading>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<roll>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<pitch>-?\d+(?:\.\d+)?)\s*,\s*"
-    r"(?P<heave>-?\d+(?:\.\d+)?)\s*,\s*HC"
-)
-
 
 @dataclass
 class FilterConfig:
@@ -29,31 +20,117 @@ class FilterConfig:
     max_heading: float | None = None
 
 
-def parse_npd_file(uploaded_file) -> pd.DataFrame:
-    raw = uploaded_file.read()
-    text = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
+def parse_float_safe(value: str):
+    if value is None:
+        return None
+    s = str(value).strip()
+    if s == "":
+        return None
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
+
+def parse_timestamp_safe(text: str):
+    text = str(text).strip()
+    formats = [
+        "%d.%m.%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%d.%m.%y %H:%M:%S",
+    ]
+    for fmt in formats:
+        ts = pd.to_datetime(text, format=fmt, errors="coerce")
+        if pd.notna(ts):
+            return ts
+    return pd.NaT
+
+
+def parse_npd_text(text: str, source_name: str = "uploaded_file") -> pd.DataFrame:
     rows = []
-    for m in NPD_PATTERN.finditer(text):
-        ts = pd.to_datetime(m.group("timestamp"), format="%d.%m.%Y %H:%M:%S", errors="coerce")
-        if pd.isna(ts):
+    skipped = 0
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
             continue
+
+        lower = line.lower()
+        if any(tag in lower for tag in ["time", "date", "heading", "roll", "pitch", "heave"]):
+            continue
+
+        line = re.sub(r"[;\t]+", ",", line)
+        parts = [p.strip() for p in line.split(",") if p.strip() != ""]
+
+        if len(parts) < 5:
+            skipped += 1
+            continue
+
+        ts = pd.NaT
+        data_start_idx = None
+
+        if len(parts) >= 2:
+            ts = parse_timestamp_safe(f"{parts[0]} {parts[1]}")
+            if pd.notna(ts):
+                data_start_idx = 2
+
+        if pd.isna(ts):
+            ts = parse_timestamp_safe(parts[0])
+            if pd.notna(ts):
+                data_start_idx = 1
+
+        if pd.isna(ts) or data_start_idx is None:
+            skipped += 1
+            continue
+
+        numeric_vals = []
+        for p in parts[data_start_idx:]:
+            val = parse_float_safe(p)
+            if val is not None:
+                numeric_vals.append(val)
+
+        if len(numeric_vals) < 4:
+            skipped += 1
+            continue
+
+        heading, roll, pitch, heave = numeric_vals[:4]
+
         rows.append(
             {
                 "timestamp": ts,
-                "heading_deg": float(m.group("heading")),
-                "roll_deg": float(m.group("roll")),
-                "pitch_deg": float(m.group("pitch")),
-                "heave_m": float(m.group("heave")),
+                "heading_deg": heading,
+                "roll_deg": roll,
+                "pitch_deg": pitch,
+                "heave_m": heave,
+                "source_file": source_name,
+                "raw_line": raw_line,
             }
         )
 
     if not rows:
-        sample = text[:500].replace("\n", " ")
-        raise ValueError(f"No valid motion rows found. First 500 chars: {sample}")
+        sample = text[:1000].replace("\n", " ")
+        raise ValueError(
+            f"No valid motion rows found in {source_name}. "
+            f"Parser expected a timestamp plus at least 4 numeric motion fields. "
+            f"First 1000 chars: {sample}"
+        )
 
-    df = pd.DataFrame(rows).sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
+    df = (
+        pd.DataFrame(rows)
+        .sort_values("timestamp")
+        .drop_duplicates(subset=["timestamp"])
+        .reset_index(drop=True)
+    )
+
     return df
+
+
+def parse_npd_file(uploaded_file) -> pd.DataFrame:
+    raw = uploaded_file.read()
+    text = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    return parse_npd_text(text, source_name=getattr(uploaded_file, "name", "uploaded_file"))
 
 
 def estimate_dt_seconds(df: pd.DataFrame) -> float:
@@ -64,6 +141,13 @@ def estimate_dt_seconds(df: pd.DataFrame) -> float:
     if dt.empty:
         return 1.0
     return float(dt.median())
+
+
+def rms(series: pd.Series) -> float:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        return float("nan")
+    return float(np.sqrt(np.mean(np.square(s))))
 
 
 def detrend_linear(series: pd.Series) -> pd.Series:
@@ -77,8 +161,7 @@ def detrend_linear(series: pd.Series) -> pd.Series:
         return pd.Series(vals - np.nanmean(vals), index=s.index)
     coeffs = np.polyfit(idx[mask], vals[mask], 1)
     trend = coeffs[0] * idx + coeffs[1]
-    out = vals - trend
-    return pd.Series(out, index=s.index)
+    return pd.Series(vals - trend, index=s.index)
 
 
 def fft_bandpass_series(series: pd.Series, dt_seconds: float, low_hz=None, high_hz=None) -> pd.Series:
@@ -86,20 +169,25 @@ def fft_bandpass_series(series: pd.Series, dt_seconds: float, low_hz=None, high_
     vals = s.to_numpy(dtype=float)
     if len(vals) < 4 or dt_seconds <= 0:
         return s - s.mean()
+
     x = vals.copy()
     mask_valid = np.isfinite(x)
     if mask_valid.sum() < 4:
         return pd.Series(x - np.nanmean(x), index=s.index)
+
     if not mask_valid.all():
         x = pd.Series(x).interpolate(limit_direction="both").to_numpy(dtype=float)
+
     x = x - np.mean(x)
     freqs = np.fft.rfftfreq(len(x), d=dt_seconds)
     spec = np.fft.rfft(x)
+
     mask = np.ones_like(freqs, dtype=bool)
     if low_hz is not None and low_hz > 0:
         mask &= freqs >= low_hz
     if high_hz is not None and high_hz > 0:
         mask &= freqs <= high_hz
+
     spec[~mask] = 0
     out = np.fft.irfft(spec, n=len(x))
     return pd.Series(out, index=s.index)
@@ -113,34 +201,26 @@ def max_heave_amplitude(series: pd.Series) -> float:
     return float(np.max(np.abs(centered)))
 
 
-def heave_acceleration_rms(series: pd.Series, dt_seconds: float) -> float:
-    s = pd.to_numeric(series, errors="coerce")
-    if len(s.dropna()) < 3 or dt_seconds <= 0:
+def heave_acceleration_rms(series: pd.Series, dt_seconds: float, low_hz=None, high_hz=None) -> float:
+    filtered = fft_bandpass_series(series, dt_seconds, low_hz=low_hz, high_hz=high_hz)
+    vals = filtered.to_numpy(dtype=float)
+    if len(vals) < 3 or dt_seconds <= 0:
         return float("nan")
-    vals = s.to_numpy(dtype=float)
-    if not np.isfinite(vals).all():
-        vals = pd.Series(vals).interpolate(limit_direction="both").to_numpy(dtype=float)
-    vals = vals - np.mean(vals)
     acc = np.gradient(np.gradient(vals, dt_seconds), dt_seconds)
     return float(np.sqrt(np.mean(acc ** 2))) if len(acc) else float("nan")
-
-
-def rms(series: pd.Series) -> float:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if s.empty:
-        return float("nan")
-    return float(np.sqrt(np.mean(np.square(s))))
 
 
 def motion_diagnostics(df: pd.DataFrame, low_hz: float = 0.03, high_hz: float = 0.5) -> pd.DataFrame:
     dt = estimate_dt_seconds(df)
     rows = []
     mapping = [("roll_deg", "deg"), ("pitch_deg", "deg"), ("heave_m", "m")]
+
     for col, unit in mapping:
         raw = pd.to_numeric(df[col], errors="coerce")
         demeaned = raw - raw.mean()
         detrended = detrend_linear(raw)
         filtered = fft_bandpass_series(detrended, dt, low_hz=low_hz, high_hz=high_hz)
+
         rows.append(
             {
                 "metric": col,
@@ -152,9 +232,12 @@ def motion_diagnostics(df: pd.DataFrame, low_hz: float = 0.03, high_hz: float = 
                 "rms_filtered": rms(filtered),
                 "sample_dt_s": dt,
                 "max_heave_amplitude": max_heave_amplitude(raw) if col == "heave_m" else np.nan,
-                "heave_accel_rms_m_s2": heave_acceleration_rms(detrended, dt) if col == "heave_m" else np.nan,
+                "heave_accel_rms_m_s2": heave_acceleration_rms(
+                    detrended, dt, low_hz=low_hz, high_hz=high_hz
+                ) if col == "heave_m" else np.nan,
             }
         )
+
     return pd.DataFrame(rows)
 
 
@@ -204,10 +287,12 @@ def enrich_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_summary(file_name: str, raw_df: pd.DataFrame, filt_df: pd.DataFrame) -> dict:
     dt = estimate_dt_seconds(raw_df)
-    duration_s = max(
-        0.0,
-        (raw_df["timestamp"].max() - raw_df["timestamp"].min()).total_seconds(),
-    ) if len(raw_df) else 0.0
+    duration_s = (
+        max(0.0, (raw_df["timestamp"].max() - raw_df["timestamp"].min()).total_seconds())
+        if len(raw_df)
+        else 0.0
+    )
+
     return {
         "file_name": file_name,
         "rows_total": int(len(raw_df)),
@@ -229,6 +314,7 @@ def build_summary(file_name: str, raw_df: pd.DataFrame, filt_df: pd.DataFrame) -
 
 def make_plot(df: pd.DataFrame, file_name: str):
     fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+
     axes[0].plot(df["timestamp"], df["heading_deg"], lw=1)
     axes[0].set_ylabel("Heading")
     axes[0].grid(True, alpha=0.3)
@@ -268,10 +354,18 @@ def build_zip(results: dict[str, dict]) -> bytes:
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         summaries = []
+        diagnostics_tables = []
+
         for name, payload in results.items():
             summaries.append(payload["summary"])
             zf.writestr(f"parsed/{name}.parsed.csv", payload["raw_df"].to_csv(index=False))
             zf.writestr(f"filtered/{name}.filtered.csv", payload["filtered_df"].to_csv(index=False))
+
+            if "diagnostics_df" in payload and payload["diagnostics_df"] is not None:
+                diag = payload["diagnostics_df"].copy()
+                diag.insert(0, "file_name", name)
+                diagnostics_tables.append(diag)
+                zf.writestr(f"diagnostics/{name}.diagnostics.csv", diag.to_csv(index=False))
 
             fig = make_plot(payload["filtered_df"], name)
             img = io.BytesIO()
@@ -281,16 +375,23 @@ def build_zip(results: dict[str, dict]) -> bytes:
             zf.writestr(f"plots/{name}.png", img.read())
 
         zf.writestr("summary/rms_summary.csv", pd.DataFrame(summaries).to_csv(index=False))
+        if diagnostics_tables:
+            zf.writestr(
+                "summary/motion_diagnostics.csv",
+                pd.concat(diagnostics_tables, ignore_index=True).to_csv(index=False),
+            )
+
     mem.seek(0)
     return mem.read()
 
 
 st.title("NaviPac NPD RMS extractor")
-st.write("Upload text-style `.NPD` files, filter by heading, and export RMS for roll, pitch, and heave.")
+st.write("Upload NaviPac `.NPD` files, filter by heading, and inspect RMS, heave amplitude, and heave acceleration.")
 
 with st.sidebar:
     st.header("Heading filter")
     mode = st.selectbox("Mode", ["All headings", "Target heading ± tolerance", "Heading range"])
+
     target_heading = tolerance = min_heading = max_heading = None
     if mode == "Target heading ± tolerance":
         target_heading = st.number_input("Target heading (deg)", value=170.0, min_value=0.0, max_value=360.0, step=0.1)
@@ -313,14 +414,28 @@ if uploaded_files:
     results = {}
     parse_errors = {}
 
+    diag_low_hz = st.number_input("Diagnostics low-cut frequency (Hz)", min_value=0.0, value=0.03, step=0.01, format="%.2f")
+    diag_high_hz = st.number_input("Diagnostics high-cut frequency (Hz)", min_value=0.0, value=0.50, step=0.01, format="%.2f")
+
     for f in uploaded_files:
         try:
             raw_df = parse_npd_file(f)
             filtered_df = apply_heading_filter(raw_df, cfg)
             filtered_df = enrich_df(filtered_df) if not filtered_df.empty else filtered_df.copy()
+            diagnostics_df = (
+                motion_diagnostics(
+                    filtered_df,
+                    low_hz=diag_low_hz if diag_low_hz > 0 else None,
+                    high_hz=diag_high_hz if diag_high_hz > 0 else None,
+                )
+                if not filtered_df.empty
+                else None
+            )
+
             results[f.name] = {
                 "raw_df": raw_df,
                 "filtered_df": filtered_df,
+                "diagnostics_df": diagnostics_df,
                 "summary": build_summary(f.name, raw_df, filtered_df),
             }
         except Exception as e:
@@ -354,6 +469,12 @@ if uploaded_files:
         selected = st.selectbox("Inspect file", list(results.keys()))
         payload = results[selected]
 
+        meta1, meta2, meta3, meta4 = st.columns(4)
+        meta1.metric("Parsed rows", len(payload["raw_df"]))
+        meta2.metric("Filtered rows", len(payload["filtered_df"]))
+        meta3.metric("Start", str(payload["raw_df"]["timestamp"].min()))
+        meta4.metric("End", str(payload["raw_df"]["timestamp"].max()))
+
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("### Parsed preview")
@@ -362,30 +483,22 @@ if uploaded_files:
             st.markdown("### Filtered preview")
             st.dataframe(payload["filtered_df"].head(20), use_container_width=True)
 
-        if not payload["filtered_df"].empty:
+        if payload["diagnostics_df"] is not None:
             st.subheader("Motion diagnostics")
-            diag_low_hz = st.number_input("Diagnostics low-cut frequency (Hz)", min_value=0.0, value=0.03, step=0.01, format="%.2f")
-            diag_high_hz = st.number_input("Diagnostics high-cut frequency (Hz)", min_value=0.0, value=0.50, step=0.01, format="%.2f")
+            st.dataframe(payload["diagnostics_df"], use_container_width=True)
 
-            diagnostics_df = motion_diagnostics(
-                payload["filtered_df"],
-                low_hz=diag_low_hz if diag_low_hz > 0 else None,
-                high_hz=diag_high_hz if diag_high_hz > 0 else None,
-            )
-            st.dataframe(diagnostics_df, use_container_width=True)
-
-            heave_diag = diagnostics_df[diagnostics_df["metric"] == "heave_m"].copy()
+            heave_diag = payload["diagnostics_df"][payload["diagnostics_df"]["metric"] == "heave_m"].copy()
             if not heave_diag.empty:
                 st.subheader("Heave extra outputs")
-                c1, c2 = st.columns(2)
-                c1.metric("Maximum heave amplitude", f"{heave_diag['max_heave_amplitude'].iloc[0]:.3f} m")
-                c2.metric("RMS heave acceleration", f"{heave_diag['heave_accel_rms_m_s2'].iloc[0]:.3f} m/s²")
+                h1, h2 = st.columns(2)
+                h1.metric("Maximum heave amplitude", f"{heave_diag['max_heave_amplitude'].iloc[0]:.3f} m")
+                h2.metric("RMS heave acceleration", f"{heave_diag['heave_accel_rms_m_s2'].iloc[0]:.3f} m/s²")
 
             st.caption(
                 "Raw RMS includes static offset or bias. Demeaned RMS removes average offset. "
                 "Detrended RMS also removes linear drift. Filtered RMS applies a simple FFT band-pass "
                 "to the detrended signal. Maximum heave amplitude is the peak absolute heave about the mean. "
-                "RMS heave acceleration is derived from the detrended heave signal using a second numerical derivative."
+                "RMS heave acceleration is derived from the band-passed detrended heave signal using a second numerical derivative."
             )
 
         st.markdown("### Plot")
@@ -396,4 +509,4 @@ if uploaded_files:
             st.pyplot(fig, use_container_width=True)
             plt.close(fig)
 else:
-    st.info("Upload one or more text-style NaviPac NPD files to begin.")
+    st.info("Upload one or more NaviPac NPD files to begin.")
