@@ -50,7 +50,6 @@ def parse_timestamp_safe(text: str):
 
 def parse_npd_text(text: str, source_name: str = "uploaded_file") -> pd.DataFrame:
     rows = []
-    skipped = 0
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -65,7 +64,6 @@ def parse_npd_text(text: str, source_name: str = "uploaded_file") -> pd.DataFram
         parts = [p.strip() for p in line.split(",") if p.strip() != ""]
 
         if len(parts) < 5:
-            skipped += 1
             continue
 
         ts = pd.NaT
@@ -82,7 +80,6 @@ def parse_npd_text(text: str, source_name: str = "uploaded_file") -> pd.DataFram
                 data_start_idx = 1
 
         if pd.isna(ts) or data_start_idx is None:
-            skipped += 1
             continue
 
         numeric_vals = []
@@ -92,7 +89,6 @@ def parse_npd_text(text: str, source_name: str = "uploaded_file") -> pd.DataFram
                 numeric_vals.append(val)
 
         if len(numeric_vals) < 4:
-            skipped += 1
             continue
 
         heading, roll, pitch, heave = numeric_vals[:4]
@@ -116,13 +112,12 @@ def parse_npd_text(text: str, source_name: str = "uploaded_file") -> pd.DataFram
             f"First 1000 chars: {sample}"
         )
 
-    df = (
+    return (
         pd.DataFrame(rows)
         .sort_values("timestamp")
         .drop_duplicates(subset=["timestamp"])
         .reset_index(drop=True)
     )
-    return df
 
 
 def parse_npd_file(uploaded_file) -> pd.DataFrame:
@@ -216,7 +211,7 @@ def heave_acceleration_rms(series: pd.Series, dt_seconds: float, low_hz=None, hi
     return float(np.sqrt(np.mean(acc ** 2))) if len(acc) else float("nan")
 
 
-def motion_diagnostics(df: pd.DataFrame, low_hz: float = 0.03, high_hz: float = 0.5) -> pd.DataFrame:
+def motion_diagnostics(df: pd.DataFrame, low_hz: float = 0.03, high_hz: float = 0.35) -> pd.DataFrame:
     dt = estimate_dt_seconds(df)
     rows = []
     mapping = [("roll_deg", "deg"), ("pitch_deg", "deg"), ("heave_m", "m")]
@@ -400,8 +395,8 @@ def build_zip(results: dict[str, dict]) -> bytes:
 
 st.title("NaviPac NPD RMS extractor")
 st.write(
-    "Upload NaviPac .NPD files, filter by heading, and inspect RMS, "
-    "heave amplitude, peak-to-peak, and heave acceleration."
+    "Upload NaviPac .NPD files, filter by heading, and inspect RMS, heave amplitude, "
+    "peak-to-peak, and heave acceleration."
 )
 
 with st.sidebar:
@@ -438,11 +433,33 @@ if uploaded_files:
     results = {}
     parse_errors = {}
 
+    st.markdown("### Diagnostics settings")
+    st.caption(
+        "Frequency cutoffs are used only for the filtered diagnostics table and heave acceleration output. "
+        "Low-cut removes slow drift, offset, and very long-period trend. High-cut removes short-period noise "
+        "and spikes so the filtered RMS focuses on the vessel motion band rather than all raw variation."
+    )
+    st.caption(
+        "For an 83 m PSV in North Sea operations, a practical starting point is low-cut 0.03 Hz "
+        "(about 33 s period) and high-cut 0.35 Hz. A wider high-cut such as 0.50 Hz can be used if you "
+        "want to retain more rapid motion content."
+    )
+
     diag_low_hz = st.number_input(
-        "Diagnostics low-cut frequency (Hz)", min_value=0.0, value=0.03, step=0.01, format="%.2f"
+        "Diagnostics low-cut frequency (Hz)",
+        min_value=0.0,
+        value=0.03,
+        step=0.01,
+        format="%.2f",
+        help="Removes very slow drift and long-period trend from the diagnostics signal.",
     )
     diag_high_hz = st.number_input(
-        "Diagnostics high-cut frequency (Hz)", min_value=0.0, value=0.50, step=0.01, format="%.2f"
+        "Diagnostics high-cut frequency (Hz)",
+        min_value=0.0,
+        value=0.35,
+        step=0.01,
+        format="%.2f",
+        help="Removes very fast noise and short spikes from the diagnostics signal.",
     )
 
     for f in uploaded_files:
@@ -504,22 +521,30 @@ if uploaded_files:
         meta3.metric("Start", str(payload["raw_df"]["timestamp"].min()))
         meta4.metric("End", str(payload["raw_df"]["timestamp"].max()))
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("### Parsed preview")
+        with st.expander("Parsed preview", expanded=False):
+            st.caption(
+                "This table shows the first parsed rows from the uploaded NPD file after conversion "
+                "into timestamp, heading, roll, pitch, and heave columns."
+            )
             st.dataframe(payload["raw_df"].head(20), use_container_width=True)
-        with c2:
-            st.markdown("### Filtered preview")
+
+        with st.expander("Filtered preview", expanded=False):
+            st.caption(
+                "This table shows only the rows that passed the selected heading filter. "
+                "These rows are used for RMS calculations, rolling RMS, and diagnostics."
+            )
             st.dataframe(payload["filtered_df"].head(20), use_container_width=True)
 
         if payload["diagnostics_df"] is not None:
             st.subheader("Motion diagnostics")
+            st.caption(
+                "Raw RMS is calculated directly from the filtered heading subset. Demeaned RMS removes "
+                "average offset. Detrended RMS removes linear drift. Filtered RMS applies the selected "
+                "frequency cutoffs."
+            )
             st.dataframe(payload["diagnostics_df"], use_container_width=True)
 
-            heave_diag = payload["diagnostics_df"][
-                payload["diagnostics_df"]["metric"] == "heave_m"
-            ].copy()
-
+            heave_diag = payload["diagnostics_df"][payload["diagnostics_df"]["metric"] == "heave_m"].copy()
             if not heave_diag.empty:
                 st.subheader("Heave extra outputs")
                 h1, h2, h3 = st.columns(3)
@@ -531,11 +556,9 @@ if uploaded_files:
                 )
 
             st.caption(
-                "Raw RMS includes static offset or bias. Demeaned RMS removes average offset. "
-                "Detrended RMS also removes linear drift. Filtered RMS applies a simple FFT band-pass "
-                "to the detrended signal. Maximum heave amplitude is the peak absolute heave about the mean. "
-                "Heave peak-to-peak is max minus min about the mean. RMS heave acceleration is derived "
-                "from the band-passed detrended heave signal using a second numerical derivative."
+                "Maximum heave amplitude is the peak absolute heave about the mean. Heave peak-to-peak is "
+                "the full crest-to-trough range about the mean. RMS heave acceleration is derived from the "
+                "band-passed detrended heave signal."
             )
 
         st.markdown("### Plot")
